@@ -65,3 +65,17 @@ config/*.yml
 
 # System Files
 .DS_Store
+Secven/
+
+
+#netoy
+.env
+.env.*
+node_modules/
+dist/
+build/
+coverage/
+.npm/
+*.log
+*.tmp
+bad.pem

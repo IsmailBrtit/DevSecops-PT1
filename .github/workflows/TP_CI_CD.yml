@@ -1,0 +1,29 @@
+name: CI/CD  Pipeline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check_changes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Télécharger le code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 
+      - name: Voir les fichiers modifies
+        run: |
+          if [ $(git rev-list --count HEAD) -gt 1 ]; then
+            git diff --name-only HEAD~1 > changed_files.txt
+          else
+            git ls-files > changed_files.txt
+          fi
+      
+      - name: Sauvegarder la liste
+        uses: actions/upload-artifact@v4
+        with:
+          name: fichiers-modifies
+          path: changed_files.txt
+
+ 
