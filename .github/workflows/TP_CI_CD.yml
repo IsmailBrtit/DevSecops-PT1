@@ -1,0 +1,21 @@
+name: CI/CD  Pipeline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check_changes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Télécharger le code
+        uses: actions/checkout@v4
+      - name: Voir les fichiers modifies
+        run: git diff --name-only HEAD~1 > changed_files.txt
+      - name: Sauvegarder la liste
+        uses: actions/upload-artifact@v4
+        with:
+          name: fichiers-modifies
+          path: changed_files.txt
+
+ 
