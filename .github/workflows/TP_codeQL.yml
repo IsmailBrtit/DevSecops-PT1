@@ -1,14 +1,167 @@
-name: CodeQL basic
+name: "CodeQL Scan"
 
-on: [push]
+on:
+  push:
+  pull_request:
 
 jobs:
   analyze:
+    name: Analyze
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript', 'typescript' ]
     steps:
-      - uses: actions/checkout@v4
-      - name: CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript
-      - uses: github/codeql-action/analyze@v3
+    - name: Checkout repository
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        queries: security-extended
+        config: |
+          paths-ignore:
+            - 'data/static/codefixes'
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "security-and-quality"
+        output: results.bqrs
+        upload: false
+
+    - name: Locate CodeQL CLI and set CODEQL_PATH
+      run: |
+        CLI_CANDIDATE=(/opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql)
+        if [ -x "${CLI_CANDIDATE[0]}" ]; then
+          echo "Using CodeQL from toolcache: ${CLI_CANDIDATE[0]}"
+          echo "CODEQL_PATH=${CLI_CANDIDATE[0]}" >> $GITHUB_ENV
+        else
+          echo "CodeQL CLI not found in toolcache. Downloading fallback..."
+          curl -sSLO https://github.com/github/codeql-action/releases/download/codeql-bundle-2.23.3/codeql-bundle-linux64.tar.gz
+          tar -xzf codeql-bundle-linux64.tar.gz
+          echo "CODEQL_PATH=$(pwd)/codeql/codeql" >> $GITHUB_ENV
+        fi
+
+    - name: Decode/Merge CodeQL results (BQRS or SARIF) -> results.sarif
+      run: |
+        set -euo pipefail
+        mkdir -p codeql-report
+        echo "PWD: $(pwd)"
+        echo "Listing results.bqrs contents:"
+        ls -la results.bqrs || true
+
+        # 1) If results.bqrs contains .bqrs files, decode each to per-lang SARIF
+        shopt -s nullglob
+        bqrs_files=(results.bqrs/*.bqrs)
+        sarif_files=(results.bqrs/*.sarif)
+
+        if [ ${#bqrs_files[@]} -gt 0 ]; then
+          echo "Found ${#bqrs_files[@]} .bqrs files — decoding to SARIF..."
+          for f in "${bqrs_files[@]}"; do
+            base=$(basename "$f" .bqrs)
+            out="codeql-report/${base}.sarif"
+            echo "Decoding $f -> $out"
+            $CODEQL_PATH bqrs decode "$f" --format=sarifv2.1.0 --output="$out" || true
+            ls -lh "$out" || true
+          done
+          sarif_files=(codeql-report/*.sarif)
+        fi
+
+        # 2) If results.bqrs already contains .sarif files (action may produce these)
+        if [ ${#sarif_files[@]} -gt 0 ]; then
+          echo "Found ${#sarif_files[@]} SARIF files. Preparing to merge:"
+          for s in "${sarif_files[@]}"; do echo " - $s"; done
+          # Merge all SARIF runs into a single SARIF file
+          jq -s '{version: "2.1.0", runs: (map(.runs) | add)}' "${sarif_files[@]}" > codeql-report/results.sarif || true
+          echo "Merged SARIF written to codeql-report/results.sarif"
+          ls -lh codeql-report/results.sarif || true
+        else
+          echo "No .bqrs or .sarif files found in results.bqrs. CodeQL may not have produced results."
+        fi
+
+    - name: Debug SARIF counts & generate TSV
+      run: |
+        set -euo pipefail
+        if [ -f codeql-report/results.sarif ] && [ -s codeql-report/results.sarif ]; then
+          echo "SARIF exists and is non-empty. Printing counts:"
+          echo "Number of runs:"
+          jq '.runs | length' codeql-report/results.sarif || true
+          echo "Results per run:"
+          jq -r '.runs[]?.results? | length' codeql-report/results.sarif || true
+
+          echo "Generating TSV (ruleId, level, message, file, line)..."
+          jq -r '
+            .runs[]?.results[]?
+            | [
+                (.ruleId // "N/A"),
+                (.level // .properties.severity // "note"),
+                (.message.text // .message.markdown // ""),
+                (.locations[0].physicalLocation.artifactLocation.uri // "N/A"),
+                ((.locations[0].physicalLocation.region.startLine // "N/A") | tostring)
+              ]
+            | @tsv
+          ' codeql-report/results.sarif > codeql-report/results.tsv || true
+          echo "TSV generated:"
+          ls -lh codeql-report/results.tsv || true
+        else
+          echo "No SARIF results to convert. Creating placeholder TSV."
+          printf "" > codeql-report/results.tsv || true
+        fi
+
+    - name: Build HTML report from TSV
+      run: |
+        mkdir -p codeql-report
+        cat > codeql-report/report.html <<'HTML'
+        <!doctype html><html><head><meta charset="utf-8"><title>CodeQL Report</title>
+        <style>
+          body{font-family:Arial;margin:20px}
+          table{border-collapse:collapse;width:100%}
+          th,td{border:1px solid #ddd;padding:8px;vertical-align:top}
+          th{background:#f2f2f2}
+          pre{white-space:pre-wrap}
+          .critical{background:#fdd}.high{background:#fed7d7}.medium{background:#fff4cc}.low{background:#e8f5e9}.note{}
+        </style>
+        </head><body><h1>CodeQL Analysis Report</h1>
+        <p>Generated by GitHub Actions (merged SARIF if multiple languages were produced).</p>
+        <table><thead><tr><th>Rule</th><th>Severity</th><th>Message</th><th>File:Line</th></tr></thead><tbody>
+        HTML
+
+        if [ -s codeql-report/results.tsv ]; then
+          awk -F'\t' '{
+            sev=tolower($2);
+            cls="note";
+            if(sev ~ /critical/) cls="critical";
+            else if(sev ~ /high/) cls="high";
+            else if(sev ~ /medium/) cls="medium";
+            else if(sev ~ /low/) cls="low";
+            gsub("&","&amp;",$3); gsub("<","&lt;",$3); gsub(">","&gt;",$3);
+            printf "<tr class=\"%s\"><td>%s</td><td>%s</td><td><pre>%s</pre></td><td>%s:%s</td></tr>\n", cls, $1, $2, $3, $4, $5
+          }' codeql-report/results.tsv >> codeql-report/report.html || true
+        fi
+
+        cat >> codeql-report/report.html <<'HTML'
+        </tbody></table></body></html>
+        HTML
+
+        echo "Report generated: codeql-report/report.html"
+        ls -lh codeql-report/report.html || true
+
+
+    - name: Upload SARIF and HTML Report artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-scan-artifacts-${{ matrix.language }}-${{ github.run_id }}
+        path: |
+          codeql-report/report.html
+          codeql-report/results.sarif
+          codeql-report/results.tsv
