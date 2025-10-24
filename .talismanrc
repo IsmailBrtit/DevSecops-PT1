@@ -1,0 +1,4 @@
+fileignoreconfig:
+- filename: .github/workflows/TP_codeQL.yml
+  checksum: 2b215670ab416d9b3b627611aae664d0df11c69ddc4d78a0f48fe3a753450479
+version: "1.0"

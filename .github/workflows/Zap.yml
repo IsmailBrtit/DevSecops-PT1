@@ -1,0 +1,58 @@
+name: DAST - OWASP ZAP Scan
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  dast:
+    runs-on: ubuntu-latest
+    name: Dynamic Application Security Testing (OWASP ZAP)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Juice Shop Docker image
+        run: |
+          docker build -t juice-shop:latest .
+
+      - name: Create docker network
+        run: |
+          docker network create zap-net || true
+
+      - name: Run Juice Shop container on network
+        run: |
+          docker run -d --name juice-shop --network zap-net juice-shop:latest
+          echo "Waiting for Juice Shop to start..."
+          sleep 20
+          docker ps --filter name=juice-shop
+
+      - name: Run OWASP ZAP Baseline Scan (on same network)
+        run: |
+          mkdir -p zap-report
+          sudo chmod -R 777 zap-report
+          # use GHCR official ZAP image
+          docker run --rm \
+            --network zap-net \
+            -v "${{ github.workspace }}/zap-report:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://juice-shop:3000 \
+              -I \
+              -r zap-report.html \
+              -w zap-warnings.txt \
+              -x zap-report.xml \
+              -J zap-report.json \
+              -m 5
+
+      - name: Stop and remove Juice Shop container
+        if: always()
+        run: |
+          docker rm -f juice-shop || true
+
+      - name: Upload ZAP Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZAP-DAST-Report
+          path: zap-report/
