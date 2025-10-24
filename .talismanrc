@@ -1,4 +1,6 @@
-fileignoreconfig:
-- filename: .github/workflows/TP_codeQL.yml
-  checksum: 2b215670ab416d9b3b627611aae664d0df11c69ddc4d78a0f48fe3a753450479
 version: "1.0"
+fileignoreconfig:
+  - filename: .github/workflows/TP_codeQL.yml
+    checksum: 2b215670ab416d9b3b627611aae664d0df11c69ddc4d78a0f48fe3a753450479
+  - filename: .github/workflows/TP_CI_CD.yml
+    checksum: 61b4d94450b1d42aaaa944a5140a57167815931e9774c3cfce89c26edfaf1ae8

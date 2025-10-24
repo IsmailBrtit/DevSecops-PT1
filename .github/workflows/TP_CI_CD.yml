@@ -1,28 +1,426 @@
-name: CI/CD  Pipeline
+
+name: "DevSecOps CI/CD - Juice Shop"
 
 on:
-  
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+env:
+  NODE_VERSION: 20
+  DOCKER_IMAGE_NAME: ${{ secrets.DOCKERHUB_USER || github.repository_owner }}/juice-shop
 
 jobs:
-  check_changes:
+  talisman-check:
+    name: Talisman / Secret scan (soft)
     runs-on: ubuntu-latest
+    outputs:
+      talisman-ran: ${{ steps.check_talisman.outputs.ran }}
     steps:
-      - name: Télécharger le code
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 2 
-      - name: Voir les fichiers modifies
+
+
+      - name: Check for talisman and run if available
+        id: check_talisman
         run: |
-          if [ $(git rev-list --count HEAD) -gt 1 ]; then
-            git diff --name-only HEAD~1 > changed_files.txt
+          set -euo pipefail
+          if command -v talisman >/dev/null 2>&1; then
+            echo "talisman found, running talisman --scan"
+            talisman --scan || true
+            echo "ran=true" >> $GITHUB_OUTPUT
           else
-            git ls-files > changed_files.txt
+            echo "talisman not installed on runner. Skipping (install locally or add talisman to CI if you want it enforced)."
+            echo "ran=false" >> $GITHUB_OUTPUT
           fi
-      
-      - name: Sauvegarder la liste
+
+  setup-deps:
+    name: Install dependencies (Node)
+    needs: talisman-check
+    runs-on: ubuntu-latest
+    outputs:
+      node-mod-time: ${{ steps.installed.outputs.node_mod_time }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        id: installed
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+          # expose a simple output so other jobs can show dependency step ran
+          date +%s > /tmp/node_mod_time
+          echo "node_mod_time=$(cat /tmp/node_mod_time)" >> $GITHUB_OUTPUT
+
+      - name: Upload node_modules (artifact for downstream jobs)
         uses: actions/upload-artifact@v4
         with:
-          name: fichiers-modifies
-          path: changed_files.txt
+          name: node-modules
+          path: |
+            node_modules
+            package-lock.json
 
- 
+  codeql-scan:
+    name: SAST - CodeQL (JS/TS)
+    needs: setup-deps
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript', 'typescript' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore node_modules artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: node-modules
+          path: .
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+          config: |
+            paths-ignore:
+              - 'data/static/codefixes'
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "security-and-quality"
+          output: results.bqrs
+          upload: false
+        continue-on-error: true
+
+      - name: Locate CodeQL CLI and set CODEQL_PATH
+        run: |
+          CLI_CANDIDATE=(/opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql)
+          if [ -x "${CLI_CANDIDATE[0]}" ]; then
+            echo "Using CodeQL from toolcache: ${CLI_CANDIDATE[0]}"
+            echo "CODEQL_PATH=${CLI_CANDIDATE[0]}" >> $GITHUB_ENV
+          else
+            echo "CodeQL CLI not found in toolcache. Downloading fallback..."
+            curl -sSLO https://github.com/github/codeql-action/releases/download/codeql-bundle-2.23.3/codeql-bundle-linux64.tar.gz
+            tar -xzf codeql-bundle-linux64.tar.gz
+            echo "CODEQL_PATH=$(pwd)/codeql/codeql" >> $GITHUB_ENV
+          fi
+
+      - name: Decode/Merge CodeQL results -> results.sarif
+        run: |
+          set -euo pipefail
+          mkdir -p codeql-report
+          shopt -s nullglob
+          bqrs_files=(results.bqrs/*.bqrs)
+          sarif_files=(results.bqrs/*.sarif)
+          if [ ${#bqrs_files[@]} -gt 0 ]; then
+            for f in "${bqrs_files[@]}"; do
+              base=$(basename "$f" .bqrs)
+              out="codeql-report/${base}.sarif"
+              $CODEQL_PATH bqrs decode "$f" --format=sarifv2.1.0 --output="$out" || true
+            done
+            sarif_files=(codeql-report/*.sarif)
+          fi
+          if [ ${#sarif_files[@]} -gt 0 ]; then
+            jq -s '{version: "2.1.0", runs: (map(.runs) | add)}' "${sarif_files[@]}" > codeql-report/results.sarif || true
+          else
+            echo "No .bqrs or .sarif files found in results.bqrs."
+            printf "" > codeql-report/results.sarif || true
+          fi
+
+      - name: Generate TSV + HTML
+        run: |
+          mkdir -p codeql-report
+          if [ -s codeql-report/results.sarif ]; then
+            jq -r '
+              .runs[]?.results[]?
+              | [
+                  (.ruleId // "N/A"),
+                  (.level // .properties.severity // "note"),
+                  (.message.text // .message.markdown // ""),
+                  (.locations[0].physicalLocation.artifactLocation.uri // "N/A"),
+                  ((.locations[0].physicalLocation.region.startLine // "N/A") | tostring)
+                ]
+              | @tsv
+            ' codeql-report/results.sarif > codeql-report/results.tsv || true
+          else
+            printf "" > codeql-report/results.tsv || true
+          fi
+
+          cat > codeql-report/report.html <<'HTML'
+          <!doctype html><html><head><meta charset="utf-8"><title>CodeQL Report</title>
+          <style>body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;vertical-align:top}th{background:#f2f2f2}pre{white-space:pre-wrap}</style></head><body><h1>CodeQL Analysis Report</h1><table><thead><tr><th>Rule</th><th>Severity</th><th>Message</th><th>File:Line</th></tr></thead><tbody>
+          HTML
+
+          if [ -s codeql-report/results.tsv ]; then
+            awk -F'\t' '{
+              gsub("&","&amp;",$3); gsub("<","&lt;",$3); gsub(">","&gt;",$3);
+              printf "<tr><td>%s</td><td>%s</td><td><pre>%s</pre></td><td>%s:%s</td></tr>\n", $1, $2, $3, $4, $5
+            }' codeql-report/results.tsv >> codeql-report/report.html || true
+          fi
+          cat >> codeql-report/report.html <<'HTML'
+          </tbody></table></body></html>
+          HTML
+
+      - name: Upload CodeQL artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-report-${{ matrix.language }}-${{ github.run_id }}
+          path: codeql-report/
+
+  snyk-scan:
+    name: SCA - Snyk
+    needs: setup-deps
+    runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore node_modules
+        uses: actions/download-artifact@v4
+        with:
+          name: node-modules
+          path: .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install latest Snyk CLI
+        run: npm install -g snyk@latest
+
+      - name: Authenticate Snyk CLI (CI)
+        run: snyk auth --auth-type=token "$SNYK_TOKEN"
+
+      - name: Run Snyk test and save JSON report
+        continue-on-error: true
+        run: |
+          snyk test --json-file-output=snyk-report.json || true
+          ls -lh snyk-report.json || true
+
+      - name: Upload Snyk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report-${{ github.run_id }}
+          path: snyk-report.json
+
+  build-and-push-image:
+    name: Build & Push Docker image
+    needs: [setup-deps, snyk-scan]
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_TAG: ${{ secrets.DOCKERHUB_TAG || github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore node_modules
+        uses: actions/download-artifact@v4
+        with:
+          name: node-modules
+          path: .
+
+      - name: Build Docker image
+        run: |
+          docker build -t "${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" .
+          docker images --filter=reference="${{ env.DOCKER_IMAGE_NAME }}*"
+
+      - name: Docker login (Docker Hub) - optional
+        if: ${{ secrets.DOCKERHUB_USER && secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USER }}" --password-stdin
+
+      - name: Push Docker image (if logged in)
+        if: ${{ secrets.DOCKERHUB_USER && secrets.DOCKERHUB_TOKEN }}
+        run: |
+          docker push "${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+      - name: Upload image metadata
+        run: |
+          echo "${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" > image.txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-ref-${{ github.run_id }}
+          path: image.txt
+
+  trivy-scan:
+    name: Container scan - Trivy
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download image ref
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-ref-${{ github.run_id }}
+          path: .
+
+      - name: Read image ref
+        id: readref
+        run: |
+          IMAGE_REF=$(cat image.txt || echo "${{ env.DOCKER_IMAGE_NAME }}:$(git rev-parse --short HEAD)")
+          echo "image_ref=$IMAGE_REF" >> $GITHUB_OUTPUT
+
+      - name: Run Trivy (container) and save JSON+YAML
+        run: |
+          mkdir -p trivy-report
+          # Use docker run for trivy so no installation required
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "${{ github.workspace }}/trivy-report:/report" aquasec/trivy:latest image --format json --output /report/trivy-report.json "${{ steps.readref.outputs.image_ref }}" || true
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "${{ github.workspace }}/trivy-report:/report" aquasec/trivy:latest image --format template --template "@/contrib/html.tpl" --output /report/trivy-report.html "${{ steps.readref.outputs.image_ref }}" || true
+          ls -lh trivy-report || true
+
+      - name: Upload Trivy artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report-${{ github.run_id }}
+          path: trivy-report/
+
+  zap-dast:
+    name: DAST - OWASP ZAP Baseline
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create docker network
+        run: docker network create zap-net || true
+
+      - name: Run Juice Shop container on network
+        run: |
+          # pull if pushed, else use local built image
+          IMAGE_REF="${{ env.DOCKER_IMAGE_NAME }}:${{ secrets.DOCKERHUB_TAG || github.sha }}"
+          docker run -d --name juice-shop --network zap-net -p 3000:3000 "${{ env.DOCKER_IMAGE_NAME }}:${{ secrets.DOCKERHUB_TAG || github.sha }}" || true
+          echo "Waiting for Juice Shop to start..."
+          sleep 20
+          docker ps --filter name=juice-shop
+
+      - name: Run OWASP ZAP Baseline Scan
+        run: |
+          mkdir -p zap-report
+          sudo chmod -R 777 zap-report || true
+          docker run --rm \
+            --network zap-net \
+            -v "${{ github.workspace }}/zap-report:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://juice-shop:3000 \
+              -I \
+              -r zap-report.html \
+              -w zap-warnings.txt \
+              -x zap-report.xml \
+              -J zap-report.json \
+              -m 5 || true
+
+      - name: Stop the Juice Shop container (always)
+        if: always()
+        run: docker rm -f juice-shop || true
+
+      - name: Upload ZAP artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report-${{ github.run_id }}
+          path: zap-report/
+
+  defectdojo-import:
+    name: Import reports into DefectDojo (optional)
+    needs: [codeql-scan, snyk-scan, zap-dast, trivy-scan]
+    runs-on: ubuntu-latest
+    if: ${{ secrets.DEFECTDOJO_URL && secrets.DEFECTDOJO_API_KEY }}
+    steps:
+      - name: Download artifacts (CodeQL)
+        uses: actions/download-artifact@v4
+        with:
+          name: codeql-report-javascript-${{ github.run_id }}
+          path: codeql-artifacts || true
+
+      - name: Download Snyk artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: snyk-report-${{ github.run_id }}
+          path: snyk-artifacts || true
+
+      - name: Download ZAP artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zap-report-${{ github.run_id }}
+          path: zap-artifacts || true
+
+      - name: Import to DefectDojo (example endpoints)
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Attempting DefectDojo imports (one-by-one)"
+          # Example import for ZAP (adjust product/engagement IDs for your instance)
+          if [ -f zap-artifacts/zap-report.xml ]; then
+            echo "Uploading ZAP XML to DefectDojo..."
+            curl -k -H "Authorization: Token $DD_API_KEY" \
+              -F "file=@zap-artifacts/zap-report.xml" \
+              -F "scan_type=ZAP Scan" \
+              -F "minimum_severity=Low" \
+              "$DD_URL/api/v2/import-scan/" || true
+          fi
+
+          # Example import for Snyk (JSON)
+          if [ -f snyk-artifacts/snyk-report.json ]; then
+            echo "Uploading Snyk JSON to DefectDojo..."
+            curl -k -H "Authorization: Token $DD_API_KEY" \
+              -F "file=@snyk-artifacts/snyk-report.json" \
+              -F "scan_type=Snyk Scan" \
+              "$DD_URL/api/v2/import-scan/" || true
+          fi
+
+          # Example import for CodeQL SARIF
+          if [ -f codeql-artifacts/codeql-report/results.sarif ]; then
+            echo "Uploading CodeQL SARIF to DefectDojo..."
+            curl -k -H "Authorization: Token $DD_API_KEY" \
+              -F "file=@codeql-artifacts/codeql-report/results.sarif" \
+              -F "scan_type=Static Code Analysis" \
+              "$DD_URL/api/v2/import-scan/" || true
+          fi
+
+      - name: Done note
+        run: echo "DefectDojo import attempts finished (check DefectDojo UI)."
+
+  final-summary:
+    name: Upload all collected reports (final)
+    needs: [codeql-scan, snyk-scan, zap-dast, trivy-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate logs and artifacts (download if needed)
+        run: echo "All scan jobs finished. Artifacts uploaded per-job; check the workflow run artifacts."
+
